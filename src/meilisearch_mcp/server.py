@@ -3,6 +3,8 @@ import json
 import os
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
+from aiohttp import web
+from aiohttp.web_response import Response
 import mcp.types as types
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
@@ -19,7 +21,6 @@ def json_serializer(obj: Any) -> str:
     """Custom JSON serializer for objects not serializable by default json code"""
     if isinstance(obj, datetime):
         return obj.isoformat()
-    # Handle Meilisearch model objects by using their __dict__ if available
     if hasattr(obj, "__dict__"):
         return obj.__dict__
     return str(obj)
@@ -40,7 +41,6 @@ class MeilisearchMCPServer:
         log_dir: Optional[str] = None,
     ):
         """Initialize MCP server for Meilisearch"""
-        # Set up logging directory
         if not log_dir:
             log_dir = os.path.expanduser("~/.meilisearch-mcp/logs")
 
@@ -50,6 +50,9 @@ class MeilisearchMCPServer:
         self.meili_client = MeilisearchClient(url, api_key)
         self.chat_manager = ChatManager(self.meili_client.client)
         self.server = Server("meilisearch")
+        self._sse_queues: set[asyncio.Queue] = set()
+        self._list_tools_handler = None
+        self._call_tool_handler = None
         self._setup_handlers()
 
     def update_connection(
@@ -67,9 +70,8 @@ class MeilisearchMCPServer:
 
     def _setup_handlers(self):
         """Setup MCP request handlers"""
-
-        @self.server.list_tools()
-        async def handle_list_tools() -> list[types.Tool]:
+        
+        async def list_tools_impl() -> list[types.Tool]:
             """List available tools"""
             return [
                 types.Tool(
@@ -458,11 +460,15 @@ class MeilisearchMCPServer:
                     },
                 ),
             ]
-
-        @self.server.call_tool()
-        async def handle_call_tool(
-            name: str, arguments: Optional[Dict[str, Any]] = None
-        ) -> list[types.TextContent]:
+        
+        self._list_tools_handler = list_tools_impl
+        
+        @self.server.list_tools()
+        async def handle_list_tools() -> list[types.Tool]:
+            """List available tools - registered with MCP server"""
+            return await list_tools_impl()
+        
+        async def call_tool_impl(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
             """Handle tool execution"""
             try:
                 if name == "get-connection-settings":
@@ -513,7 +519,6 @@ class MeilisearchMCPServer:
                     ]
 
                 elif name == "get-documents":
-                    # Use default values to fix None parameter issues (related to issue #17)
                     offset = arguments.get("offset", 0)
                     limit = arguments.get("limit", 20)
                     documents = self.meili_client.documents.get_documents(
@@ -521,7 +526,6 @@ class MeilisearchMCPServer:
                         offset,
                         limit,
                     )
-                    # Convert DocumentsResults object to proper JSON format (fixes issue #16)
                     formatted_json = json.dumps(
                         documents, indent=2, default=json_serializer
                     )
@@ -594,7 +598,6 @@ class MeilisearchMCPServer:
                         sort=arguments.get("sort"),
                     )
 
-                    # Format the results for better readability
                     formatted_results = json.dumps(
                         search_results, indent=2, default=json_serializer
                     )
@@ -612,7 +615,6 @@ class MeilisearchMCPServer:
                     ]
 
                 elif name == "get-tasks":
-                    # Filter out any invalid parameters
                     valid_params = {
                         "limit",
                         "from",
@@ -777,9 +779,18 @@ class MeilisearchMCPServer:
                     arguments=arguments,
                 )
                 return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+        
+        self._call_tool_handler = call_tool_impl
+        
+        @self.server.call_tool()
+        async def handle_call_tool(
+            name: str, arguments: Optional[Dict[str, Any]] = None
+        ) -> list[types.TextContent]:
+            """Handle tool execution - registered with MCP server"""
+            return await call_tool_impl(name, arguments or {})
 
-    async def run(self):
-        """Run the MCP server"""
+    async def _run_mcp_server(self):
+        """Run the MCP server on stdio"""
         logger.info("Starting Meilisearch MCP server...")
 
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
@@ -795,6 +806,373 @@ class MeilisearchMCPServer:
                     ),
                 ),
             )
+
+    def _verify_token(self, request: web.Request) -> bool:
+        """Verify authentication token from request"""
+        expected_token = os.getenv("MCP_AUTH_TOKEN")
+        if not expected_token:
+            return True
+        
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            return token == expected_token
+        
+        token_header = request.headers.get("X-MCP-Token", "")
+        if token_header:
+            return token_header == expected_token
+        
+        return False
+
+    async def _mcp_sse_endpoint(self, request: web.Request):
+        """SSE endpoint for MCP protocol - server-to-client communication"""
+        if not self._verify_token(request):
+            logger.warning("SSE connection rejected: Unauthorized")
+            return web.json_response(
+                {"error": "Unauthorized"}, status=401
+            )
+        
+        logger.info("SSE connection established", remote=request.remote)
+        
+        response = web.StreamResponse()
+        response.headers["Content-Type"] = "text/event-stream"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "keep-alive"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        
+        await response.prepare(request)
+        
+        message_queue: asyncio.Queue = asyncio.Queue()
+        self._sse_queues.add(message_queue)
+        
+        # Send initial connection message (not JSON-RPC, just a status message)
+        # Note: This is a plain SSE message, not a JSON-RPC message
+        try:
+            await response.write(
+                b": connection established\n\n"
+            )
+            
+            while True:
+                try:
+                    message = await asyncio.wait_for(message_queue.get(), timeout=30.0)
+                    
+                    if message is None:
+                        break
+                    
+                    sse_data = f"data: {json.dumps(message)}\n\n"
+                    await response.write(sse_data.encode())
+                    # Flush to ensure message is sent immediately
+                    await response.drain()
+                    logger.debug("Sent SSE message", message_id=message.get("id") if isinstance(message, dict) else None)
+                    
+                except asyncio.TimeoutError:
+                    # Send keepalive ping
+                    try:
+                        await response.write(b": ping\n\n")
+                        await response.drain()
+                    except (asyncio.CancelledError, ConnectionError, OSError):
+                        # Connection closed, exit gracefully
+                        break
+                except asyncio.CancelledError:
+                    # Connection cancelled, exit gracefully
+                    break
+                except (ConnectionError, OSError) as e:
+                    # Connection error, exit gracefully
+                    logger.debug(f"SSE connection error: {e}")
+                    break
+                
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._sse_queues.discard(message_queue)
+            await response.write_eof()
+        
+        return response
+
+    async def _mcp_post_endpoint(self, request: web.Request):
+        """POST endpoint for MCP protocol - client-to-server communication"""
+        if not self._verify_token(request):
+            logger.warning("POST request rejected: Unauthorized")
+            return web.json_response(
+                {"jsonrpc": "2.0", "error": {"code": -32000, "message": "Unauthorized"}}, 
+                status=401,
+                headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+            )
+        
+        data = None
+        request_id = None
+        try:
+            data = await request.json()
+            request_id = data.get("id") if data else None
+            method = data.get("method") if data else None
+            logger.info(f"Received MCP request: {method}", request_id=request_id, method=method)
+            
+            if data and data.get("jsonrpc") == "2.0":
+                params = data.get("params", {})
+                
+                if method == "initialize":
+                    caps = self.server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    )
+                    # Convert capabilities to dict and ensure null values are empty objects
+                    if hasattr(caps, 'model_dump'):
+                        caps_dict = caps.model_dump()
+                    elif hasattr(caps, 'dict'):
+                        caps_dict = caps.dict()
+                    else:
+                        caps_dict = {}
+                    
+                    # Ensure all capability fields are objects, not null
+                    for key in ['logging', 'completions', 'prompts', 'resources']:
+                        if key in caps_dict and caps_dict[key] is None:
+                            caps_dict[key] = {}
+                    
+                    result = {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": caps_dict,
+                        "serverInfo": {
+                            "name": "meilisearch",
+                            "version": "0.6.0",
+                        },
+                    }
+                elif method == "tools/list":
+                    if self._list_tools_handler:
+                        tools_result = await self._list_tools_handler()
+                        tools_list = tools_result if isinstance(tools_result, list) else []
+                        logger.info(f"Retrieved {len(tools_list)} tools from handler", tool_count=len(tools_list))
+                        
+                        # Convert tools to dict format, excluding None values
+                        def clean_tool_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+                            """Remove None values from tool dict, recursively"""
+                            if isinstance(d, dict):
+                                return {
+                                    k: clean_tool_dict(v) 
+                                    for k, v in d.items() 
+                                    if v is not None
+                                }
+                            elif isinstance(d, list):
+                                return [clean_tool_dict(item) for item in d]
+                            return d
+                        
+                        tools_dict_list = []
+                        for tool in tools_list:
+                            if hasattr(tool, 'model_dump'):
+                                # Use exclude_none=True if available (Pydantic v2)
+                                try:
+                                    tool_dict = tool.model_dump(exclude_none=True)
+                                except TypeError:
+                                    # Fallback for Pydantic v1 or if exclude_none not supported
+                                    tool_dict = tool.model_dump()
+                                    tool_dict = clean_tool_dict(tool_dict)
+                            elif hasattr(tool, 'dict'):
+                                # Pydantic v1
+                                tool_dict = tool.dict(exclude_none=True)
+                            elif hasattr(tool, '__dict__'):
+                                tool_dict = clean_tool_dict(tool.__dict__)
+                            else:
+                                tool_dict = {"name": str(tool), "description": ""}
+                            tools_dict_list.append(tool_dict)
+                            logger.debug(f"Tool: {tool_dict.get('name', 'unknown')}")
+                        
+                        result = {"tools": tools_dict_list}
+                        logger.info(f"Returning {len(tools_dict_list)} tools in response", tool_count=len(tools_dict_list))
+                    else:
+                        logger.warning("tools/list requested but handler not initialized")
+                        result = {"tools": []}
+                elif method == "tools/call":
+                    tool_name = params.get("name")
+                    tool_args = params.get("arguments", {})
+                    if self._call_tool_handler:
+                        call_result = await self._call_tool_handler(tool_name, tool_args)
+                        result = {
+                            "content": [
+                                content.model_dump() if hasattr(content, 'model_dump')
+                                else content.dict() if hasattr(content, 'dict')
+                                else {"type": "text", "text": str(content)}
+                                for content in call_result
+                            ]
+                        }
+                    else:
+                        result = {"content": [{"type": "text", "text": "Handler not initialized"}]}
+                elif method == "prompts/list":
+                    # MCP clients may request prompts - we don't support them, return empty list
+                    logger.info("Received prompts/list request - returning empty list")
+                    result = {"prompts": []}
+                elif method == "resources/list":
+                    # MCP clients may request resources - we don't support them, return empty list
+                    logger.info("Received resources/list request - returning empty list")
+                    result = {"resources": []}
+                else:
+                    logger.warning(f"Unknown method requested: {method}", method=method, request_id=request_id)
+                    return web.json_response(
+                        {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}},
+                        status=200,
+                        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+                    )
+                
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": result,
+                }
+                
+                # MCP HTTP/SSE protocol: Send response via the appropriate channel
+                # For "initialize", "tools/list", "prompts/list", and "resources/list", 
+                # always send via POST response body (SSE connection might not be established yet)
+                # For other methods, prefer SSE if available
+                methods_via_post = ["initialize", "tools/list", "prompts/list", "resources/list"]
+                if method in methods_via_post or not self._sse_queues:
+                    # Send response via POST body (especially for initialize and tools/list)
+                    logger.info(f"Returning HTTP response for method {method}", request_id=request_id, via_post=True)
+                    return web.json_response(
+                        response_data,
+                        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+                    )
+                else:
+                    # Send response via SSE stream for other methods
+                    logger.info(f"Sending response via SSE for method {method}", request_id=request_id, queue_count=len(self._sse_queues))
+                    sent_count = 0
+                    for queue in self._sse_queues:
+                        try:
+                            await queue.put(response_data)
+                            sent_count += 1
+                            logger.debug(f"Queued message for SSE stream {sent_count}", request_id=request_id)
+                        except Exception as e:
+                            logger.error(f"Failed to send via SSE queue: {e}")
+                    logger.info(f"Queued response to {sent_count} SSE stream(s) for method {method}", request_id=request_id)
+                    # Return 202 Accepted since response is sent via SSE
+                    return web.Response(
+                        status=202,
+                        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+                    )
+            else:
+                return web.json_response(
+                    {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}},
+                    status=400,
+                    headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+                )
+                
+        except Exception as e:
+            logger.error(f"Error processing MCP request: {e}")
+            # request_id is already set from the try block if data was parsed
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": str(e)}},
+                status=500,
+                headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*"}
+            )
+
+    async def _create_health_check_app(self):
+        """Create HTTP health check application for Cloud Run"""
+        app = web.Application()
+
+        async def health_check(request):
+            """Health check endpoint for Cloud Run"""
+            try:
+                is_healthy = self.meili_client.health_check()
+                if is_healthy:
+                    return web.json_response(
+                        {"status": "healthy", "service": "meilisearch-mcp"}, status=200
+                    )
+                else:
+                    return web.json_response(
+                        {"status": "degraded", "service": "meilisearch-mcp", "reason": "meilisearch_unavailable"},
+                        status=503
+                    )
+            except Exception as e:
+                return web.json_response(
+                    {"status": "error", "service": "meilisearch-mcp", "error": str(e)},
+                    status=503
+                )
+        
+        async def root_handler(request):
+            """Root endpoint - redirects to MCP SSE or health check based on Accept header"""
+            accept = request.headers.get("Accept", "")
+            if "text/event-stream" in accept or request.query_string == "sse":
+                return await self._mcp_sse_endpoint(request)
+            return await health_check(request)
+
+        app.router.add_get("/", root_handler)
+        app.router.add_get("/health", health_check)
+        app.router.add_get("/ready", health_check)
+        
+        # MCP endpoints - Cursor may connect to /mcp, /sse, /v1/sse, or root
+        # Note: Some MCP clients use the same path for both GET (SSE) and POST
+        app.router.add_get("/mcp", self._mcp_sse_endpoint)
+        app.router.add_post("/mcp", self._mcp_post_endpoint)
+        app.router.add_get("/sse", self._mcp_sse_endpoint)
+        app.router.add_post("/sse", self._mcp_post_endpoint)
+        app.router.add_get("/v1/sse", self._mcp_sse_endpoint)
+        app.router.add_post("/v1/sse", self._mcp_post_endpoint)
+        app.router.add_post("/message", self._mcp_post_endpoint)
+        app.router.add_post("/v1/message", self._mcp_post_endpoint)
+        
+        # Add OPTIONS handler for CORS preflight
+        async def options_handler(request):
+            return web.Response(
+                status=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Max-Age": "86400",
+                }
+            )
+        
+        app.router.add_options("/", options_handler)
+        app.router.add_options("/mcp", options_handler)
+        app.router.add_options("/sse", options_handler)
+        app.router.add_options("/v1/sse", options_handler)
+        app.router.add_options("/message", options_handler)
+        app.router.add_options("/v1/message", options_handler)
+
+        # Log registered routes for debugging
+        logger.info("Registered HTTP routes:")
+        for route in app.router.routes():
+            logger.info(f"  {route.method} {route.resource.canonical}")
+        
+        return app
+
+    async def run(self):
+        """Run the MCP server, optionally with HTTP health check for Cloud Run"""
+        port = os.getenv("PORT")
+        
+        if port:
+            port_num = int(port)
+            logger.info(f"Cloud Run detected: Starting HTTP health check on port {port_num}")
+            
+            app = await self._create_health_check_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port_num)
+            await site.start()
+            
+            logger.info(f"HTTP health check server started on port {port_num}")
+            
+            async def run_mcp_with_error_handling():
+                try:
+                    await self._run_mcp_server()
+                except (EOFError, OSError) as e:
+                    logger.warning(
+                        f"MCP stdio server unavailable: {e}. "
+                        "Container will remain alive for health checks."
+                    )
+                    await asyncio.Event().wait()
+                except Exception as e:
+                    logger.error(f"Unexpected error in MCP server: {e}")
+                    await asyncio.Event().wait()
+            
+            asyncio.create_task(run_mcp_with_error_handling())
+            
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                logger.info("Shutting down HTTP health check server...")
+                await runner.cleanup()
+                raise
+        else:
+            await self._run_mcp_server()
 
     def cleanup(self):
         """Clean shutdown"""
