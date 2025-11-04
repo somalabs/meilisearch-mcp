@@ -1036,10 +1036,11 @@ class MeilisearchMCPServer:
                 }
                 
                 # MCP HTTP/SSE protocol: Send response via the appropriate channel
-                # For "initialize", "tools/list", "prompts/list", and "resources/list", 
+                # For "initialize", "tools/list", "tools/call", "prompts/list", and "resources/list", 
                 # always send via POST response body (SSE connection might not be established yet)
+                # Tool calls need immediate responses, so always use POST
                 # For other methods, prefer SSE if available
-                methods_via_post = ["initialize", "tools/list", "prompts/list", "resources/list"]
+                methods_via_post = ["initialize", "tools/list", "tools/call", "prompts/list", "resources/list"]
                 if method in methods_via_post or not self._sse_queues:
                     # Send response via POST body (especially for initialize and tools/list)
                     logger.info(f"Returning HTTP response for method {method}", request_id=request_id, via_post=True)
