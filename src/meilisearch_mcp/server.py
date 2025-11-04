@@ -48,7 +48,7 @@ class MeilisearchMCPServer:
         self.url = url
         self.api_key = api_key
         self.meili_client = MeilisearchClient(url, api_key)
-        self.chat_manager = ChatManager(self.meili_client.client)
+        self.chat_manager = ChatManager(url, api_key)
         self.server = Server("meilisearch")
         self._sse_queues: set[asyncio.Queue] = set()
         self._list_tools_handler = None
@@ -61,12 +61,17 @@ class MeilisearchMCPServer:
         """Update connection settings and reinitialize client if needed"""
         if url:
             self.url = url
-        if api_key:
-            self.api_key = api_key
+        if api_key is not None:  # Allow setting to None or empty string explicitly
+            self.api_key = api_key.strip() if api_key and api_key.strip() else None
 
         self.meili_client = MeilisearchClient(self.url, self.api_key)
-        self.chat_manager = ChatManager(self.meili_client.client)
-        self.logger.info("Updated Meilisearch connection settings", url=self.url)
+        self.chat_manager = ChatManager(self.url, self.api_key)
+        self.logger.info(
+            "Updated Meilisearch connection settings",
+            url=self.url,
+            has_api_key=bool(self.api_key),
+            api_key_length=len(self.api_key) if self.api_key else 0,
+        )
 
     def _setup_handlers(self):
         """Setup MCP request handlers"""
@@ -772,11 +777,23 @@ class MeilisearchMCPServer:
                 raise ValueError(f"Unknown tool: {name}")
 
             except Exception as e:
+                # Extract more details from the exception for better debugging
+                error_details = {
+                    "tool": name,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "url": self.url,
+                    "has_api_key": bool(self.api_key),
+                }
+                
+                # If it's an HTTP error, try to extract status code and response
+                if hasattr(e, "response") and hasattr(e.response, "status_code"):
+                    error_details["status_code"] = e.response.status_code
+                    error_details["response_text"] = e.response.text[:500] if hasattr(e.response, "text") else None
+                
                 self.logger.error(
                     f"Error executing tool {name}",
-                    error=str(e),
-                    tool=name,
-                    arguments=arguments,
+                    **error_details,
                 )
                 return [types.TextContent(type="text", text=f"Error: {str(e)}")]
         
