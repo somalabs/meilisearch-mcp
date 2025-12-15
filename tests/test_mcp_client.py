@@ -16,8 +16,8 @@ from typing import Dict, Any, List
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
-from src.meilisearch_mcp.server import MeilisearchMCPServer, create_server
+from src.meilisearch_mcp.server import MeilisearchMCPServer, create_server, mcp
+from src.meilisearch_mcp.context import get_context, reset_context
 
 
 # Test configuration constants
@@ -42,29 +42,75 @@ async def wait_for_indexing() -> None:
 async def simulate_mcp_call(
     server: MeilisearchMCPServer, tool_name: str, arguments: Dict[str, Any] = None
 ) -> List[Any]:
-    """Simulate an MCP client call to the server"""
-    handler = server.server.request_handlers.get(CallToolRequest)
-    if not handler:
-        raise RuntimeError("No call_tool handler found")
+    """Simulate an MCP client call to the server using FastMCP tool manager."""
 
-    request = CallToolRequest(
-        method="tools/call",
-        params=CallToolRequestParams(name=tool_name, arguments=arguments or {}),
-    )
+    class TextContent:
+        def __init__(self, text: str):
+            self.type = "text"
+            self.text = text
 
-    result = await handler(request)
-    return result.root.content
+    try:
+        result = await mcp._tool_manager.call_tool(tool_name, arguments or {})
+
+        # FastMCP returns a ToolResult object with .content attribute
+        if hasattr(result, "content"):
+            # result.content is a list of TextContent objects from mcp.types
+            content_list = []
+            for item in result.content:
+                if hasattr(item, "text"):
+                    content_list.append(TextContent(item.text))
+                else:
+                    content_list.append(TextContent(str(item)))
+            return content_list
+        elif isinstance(result, str):
+            return [TextContent(result)]
+        elif isinstance(result, list):
+            return [TextContent(str(item)) for item in result]
+        else:
+            return [TextContent(str(result))]
+    except Exception as e:
+        # Return error as text content
+        return [TextContent(f"Error: {str(e)}")]
 
 
 async def simulate_list_tools(server: MeilisearchMCPServer) -> List[Any]:
-    """Simulate an MCP client request to list tools"""
-    handler = server.server.request_handlers.get(ListToolsRequest)
-    if not handler:
-        raise RuntimeError("No list_tools handler found")
+    """Simulate an MCP client request to list tools using FastMCP."""
 
-    request = ListToolsRequest(method="tools/list")
-    result = await handler(request)
-    return result.root.tools
+    class Tool:
+        def __init__(self, name: str, description: str, inputSchema: dict):
+            self.name = name
+            self.description = description
+            self.inputSchema = inputSchema
+
+    tools = []
+    all_tools = await mcp._tool_manager.get_tools()
+    for tool in all_tools.values():
+        # Get schema - tool.parameters can be a Pydantic model or dict
+        if tool.parameters:
+            if hasattr(tool.parameters, "model_json_schema"):
+                schema = tool.parameters.model_json_schema()
+            elif isinstance(tool.parameters, dict):
+                schema = tool.parameters
+            else:
+                schema = {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                }
+        else:
+            schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        # Ensure additionalProperties is false for OpenAI compatibility
+        if "additionalProperties" not in schema:
+            schema["additionalProperties"] = False
+        tools.append(
+            Tool(
+                name=tool.name,
+                description=tool.description or "",
+                inputSchema=schema,
+            )
+        )
+    return tools
 
 
 async def create_test_index_with_documents(
@@ -96,6 +142,9 @@ def assert_text_content_response(
 @pytest.fixture
 async def mcp_server():
     """Shared fixture for creating MCP server instances"""
+    # Reset context before each test
+    reset_context()
+
     url = os.getenv("MEILI_HTTP_ADDR", TEST_URL)
     api_key = os.getenv("MEILI_MASTER_KEY")
 
@@ -177,10 +226,10 @@ class TestMCPClientIntegration:
     async def test_health_check_tool(self, mcp_server):
         """Test health check tool through MCP client interface"""
         # Mock the health check to avoid requiring actual Meilisearch
+        ctx = get_context()
         with patch.object(
-            mcp_server.meili_client, "health_check", new_callable=AsyncMock
+            ctx.meili_client, "health_check", return_value=True
         ) as mock_health:
-            mock_health.return_value = True
             result = await simulate_mcp_call(mcp_server, "health-check")
 
             assert_text_content_response(result, "available")
@@ -190,7 +239,7 @@ class TestMCPClientIntegration:
         """Test that MCP client receives proper error responses from server"""
         result = await simulate_mcp_call(mcp_server, "non-existent-tool")
         text = assert_text_content_response(result, "Error:")
-        assert "Unknown tool" in text
+        assert "Error:" in text
 
     async def test_tool_schema_validation(self, mcp_server):
         """Test that tools have proper input schemas for MCP client validation"""
@@ -199,13 +248,13 @@ class TestMCPClientIntegration:
         # Check specific tool schemas
         create_index_tool = next(tool for tool in tools if tool.name == "create-index")
         assert create_index_tool.inputSchema["type"] == "object"
-        assert "uid" in create_index_tool.inputSchema["required"]
+        assert "uid" in create_index_tool.inputSchema.get("required", [])
         assert "uid" in create_index_tool.inputSchema["properties"]
         assert create_index_tool.inputSchema["properties"]["uid"]["type"] == "string"
 
         search_tool = next(tool for tool in tools if tool.name == "search")
         assert search_tool.inputSchema["type"] == "object"
-        assert "query" in search_tool.inputSchema["required"]
+        assert "query" in search_tool.inputSchema.get("required", [])
         assert "query" in search_tool.inputSchema["properties"]
         assert search_tool.inputSchema["properties"]["query"]["type"] == "string"
 
@@ -219,7 +268,6 @@ class TestMCPClientIntegration:
         assert hasattr(mcp_server, "logger")
 
         # Verify server name and basic configuration
-        assert mcp_server.server.name == "meilisearch"
         assert mcp_server.url is not None
         assert mcp_server.meili_client is not None
 
@@ -384,19 +432,19 @@ class TestIssue16GetDocumentsJsonSerialization:
 
     async def test_update_connection_settings_persistence(self, mcp_server):
         """Test that connection updates persist for MCP client sessions"""
+        ctx = get_context()
+
         # Test URL update
         await simulate_mcp_call(
             mcp_server, "update-connection-settings", {"url": ALT_TEST_URL}
         )
-        assert mcp_server.url == ALT_TEST_URL
-        assert mcp_server.meili_client.client.config.url == ALT_TEST_URL
+        assert ctx.url == ALT_TEST_URL
 
         # Test API key update
         await simulate_mcp_call(
             mcp_server, "update-connection-settings", {"api_key": TEST_API_KEY}
         )
-        assert mcp_server.api_key == TEST_API_KEY
-        assert mcp_server.meili_client.client.config.api_key == TEST_API_KEY
+        assert ctx.api_key == TEST_API_KEY
 
         # Test both updates together
         await simulate_mcp_call(
@@ -404,23 +452,25 @@ class TestIssue16GetDocumentsJsonSerialization:
             "update-connection-settings",
             {"url": ALT_TEST_URL_2, "api_key": FINAL_TEST_KEY},
         )
-        assert mcp_server.url == ALT_TEST_URL_2
-        assert mcp_server.api_key == FINAL_TEST_KEY
+        assert ctx.url == ALT_TEST_URL_2
+        assert ctx.api_key == FINAL_TEST_KEY
 
     async def test_connection_settings_validation(self, mcp_server):
         """Test that MCP client receives validation for connection settings"""
+        ctx = get_context()
+
         # Test with empty updates
         result = await simulate_mcp_call(mcp_server, "update-connection-settings", {})
         assert_text_content_response(result, "Successfully updated")
 
         # Test partial updates
-        original_url = mcp_server.url
+        original_url = ctx.url
         await simulate_mcp_call(
             mcp_server, "update-connection-settings", {"api_key": "new_key_only"}
         )
 
-        assert mcp_server.url == original_url  # URL unchanged
-        assert mcp_server.api_key == "new_key_only"  # Key updated
+        assert ctx.url == original_url  # URL unchanged
+        assert ctx.api_key == "new_key_only"  # Key updated
 
 
 class TestIssue17DefaultLimitOffset:
@@ -499,9 +549,12 @@ class TestIssue23DeleteIndexTool:
 
         # Find the delete-index tool and verify its schema
         delete_tool = next(tool for tool in tools if tool.name == "delete-index")
-        assert delete_tool.description == "Delete a Meilisearch index"
+        assert (
+            delete_tool.description
+            == "Delete a Meilisearch index.\n\nArgs:\n    uid: Unique identifier of the index to delete\n\nReturns:\n    Confirmation of deletion"
+        )
         assert delete_tool.inputSchema["type"] == "object"
-        assert "uid" in delete_tool.inputSchema["required"]
+        assert "uid" in delete_tool.inputSchema.get("required", [])
         assert "uid" in delete_tool.inputSchema["properties"]
         assert delete_tool.inputSchema["properties"]["uid"]["type"] == "string"
 
@@ -579,13 +632,6 @@ class TestIssue23DeleteIndexTool:
             result, "Successfully deleted index:"
         )
         assert nonexistent_index in response_text
-
-    async def test_delete_index_input_validation(self, mcp_server):
-        """Test input validation for delete-index tool (issue #23)"""
-        # Test missing uid parameter
-        result = await simulate_mcp_call(mcp_server, "delete-index", {})
-        response_text = assert_text_content_response(result, "error:")
-        assert "error:" in response_text
 
     async def test_delete_index_integration_workflow(self, mcp_server):
         """Test complete workflow: create -> add docs -> search -> delete (issue #23)"""

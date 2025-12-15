@@ -23,6 +23,7 @@ RUN uv pip install --system .
 # Set default environment variables
 ENV MEILI_HTTP_ADDR=http://meilisearch:7700
 ENV MEILI_MASTER_KEY=""
+ENV MCP_AUTH_TOKEN=""
 
 # Run the MCP server
-CMD ["uv", "run", "python", "-m", "src.meilisearch_mcp"]
+CMD ["meilisearch-mcp"]

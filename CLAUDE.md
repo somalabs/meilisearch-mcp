@@ -69,7 +69,7 @@ python -m pytest tests/test_specific_issue.py -v  # Should pass
 
 ```bash
 # Format only the files you changed
-black src/specific_file.py tests/test_specific_file.py
+black src/ tests/
 
 # Run tests to ensure no regressions
 python -m pytest tests/ -v
@@ -101,7 +101,7 @@ Before creating PR, verify:
 
 ## Project Overview
 
-This is a **Model Context Protocol (MCP) server** for Meilisearch, allowing LLM interfaces like Claude to interact with Meilisearch search engines. The project implements a Python-based MCP server that provides comprehensive tools for index management, document operations, search functionality, and system monitoring.
+This is a **Model Context Protocol (MCP) server** for Meilisearch, allowing LLM interfaces like Claude to interact with Meilisearch search engines. The project implements a Python-based MCP server using **FastMCP** that provides comprehensive tools for index management, document operations, search functionality, and system monitoring.
 
 ## Development Commands
 
@@ -153,8 +153,38 @@ npx @modelcontextprotocol/inspector python -m src.meilisearch_mcp
 
 ## Architecture
 
+### FastMCP-Based Design
+
+The codebase uses **FastMCP** for a clean, decorator-based tool implementation:
+
+```
+src/meilisearch_mcp/
+├── server.py           # FastMCP instance + HTTP/SSE endpoints
+├── context.py          # ServerContext for shared state management
+├── tools/              # Organized tool modules
+│   ├── __init__.py     # Tool registration
+│   ├── connection.py   # Connection management tools
+│   ├── indexes.py      # Index operation tools
+│   ├── documents.py    # Document operation tools
+│   ├── search.py       # Search tool
+│   ├── settings.py     # Settings tools
+│   ├── tasks.py        # Task management tools
+│   ├── keys.py         # API key tools
+│   ├── monitoring.py   # Health/monitoring tools
+│   └── chat.py         # Chat completion tools
+├── client.py           # MeilisearchClient
+├── chat.py             # ChatManager
+├── documents.py        # DocumentManager
+├── indexes.py          # IndexManager
+├── keys.py             # KeyManager
+├── logging.py          # MCPLogger
+├── monitoring.py       # MonitoringManager
+├── settings.py         # SettingsManager
+└── tasks.py            # TaskManager
+```
+
 ### Modular Manager Design
-The codebase follows a modular architecture where functionality is organized into specialized managers:
+Business logic is organized into specialized managers:
 
 ```
 MeilisearchClient
@@ -167,19 +197,34 @@ MeilisearchClient
 ```
 
 ### MCP Server Integration
-- **Server Class**: `MeilisearchMCPServer` in `server.py` handles MCP protocol communication
-- **Tool Registration**: All tools are defined with JSON schemas for input validation
+- **FastMCP Server**: Uses `FastMCP` class with decorator-based tool registration
+- **Tool Registration**: All tools defined with `@mcp.tool()` decorator for automatic schema generation
+- **Shared Context**: `ServerContext` class provides shared state via `get_context()`
 - **Error Handling**: Comprehensive exception handling with logging through `MCPLogger`
-- **Dynamic Configuration**: Runtime connection settings updates via MCP tools
+- **Dynamic Configuration**: Runtime connection settings updates via context
 
 ### Key Components
 
-#### Tool Handler Pattern
-All MCP tools follow a consistent pattern:
-1. Input validation via JSON schema
-2. Delegation to appropriate manager class
-3. Error handling with structured logging
-4. Formatted response as `TextContent`
+#### Tool Registration Pattern (FastMCP)
+All MCP tools follow the FastMCP decorator pattern:
+```python
+from fastmcp import FastMCP
+from ..context import get_context
+
+def register_tools(mcp):
+    @mcp.tool(name="tool-name")
+    def my_tool(param: str) -> str:
+        """Tool description for auto-generated schema."""
+        ctx = get_context()
+        result = ctx.meili_client.do_something(param)
+        return f"Result: {result}"
+```
+
+#### ServerContext
+The `ServerContext` class in `context.py` provides:
+- Lazy initialization of `MeilisearchClient` and `ChatManager`
+- Dynamic connection settings updates
+- Shared state across all tools
 
 #### Search Architecture
 - **Single Index Search**: Direct search in specified index
@@ -187,9 +232,9 @@ All MCP tools follow a consistent pattern:
 - **Result Aggregation**: Smart filtering of results with hits
 
 #### Connection Management
-- **Runtime Configuration**: Dynamic URL and API key updates
+- **Runtime Configuration**: Dynamic URL and API key updates via `ServerContext`
 - **Environment Variables**: `MEILI_HTTP_ADDR` and `MEILI_MASTER_KEY` for defaults
-- **Connection State**: Maintained in server instance for session persistence
+- **Connection State**: Maintained in context for session persistence
 
 ## Testing Strategy
 
@@ -200,7 +245,7 @@ All MCP tools follow a consistent pattern:
 ### Test Categories by Development Task
 
 #### When Tests are REQUIRED:
-- **New MCP Tools**: Add tests to `test_mcp_client.py` using `simulate_tool_call()`
+- **New MCP Tools**: Add tests to `test_mcp_client.py` using `simulate_mcp_call()`
 - **Existing Tool Changes**: Update corresponding test methods
 - **Manager Class Changes**: Test through MCP tool integration
 - **Bug Fixes**: Add regression tests to prevent reoccurrence
@@ -212,11 +257,10 @@ All MCP tools follow a consistent pattern:
 - **Minor Refactoring**: Internal reorganization without behavior changes
 
 ### Tool Simulation Framework
-Tests use `simulate_tool_call()` function that:
-- Directly invokes server tool handlers
-- Bypasses MCP protocol overhead  
-- Returns proper `TextContent` responses
-- Provides comprehensive coverage of all 20+ tools
+Tests use `simulate_mcp_call()` function that:
+- Directly invokes FastMCP tool manager
+- Returns proper text content responses
+- Provides comprehensive coverage of all 26 tools
 - Enables fast test execution without MCP protocol complexity
 
 ### Test Isolation and Best Practices
@@ -257,15 +301,16 @@ The repository includes Claude Code integration via GitHub Actions:
 
 ## Available MCP Tools
 
-### Core Categories
-- **Connection Management**: Dynamic configuration updates
-- **Index Operations**: CRUD operations for search indices  
-- **Document Management**: Add, retrieve, and manage documents
-- **Search Capabilities**: Single and multi-index search with filtering
-- **Settings Control**: Index configuration and optimization
-- **Task Monitoring**: Asynchronous operation tracking
-- **API Key Management**: Authentication and authorization
-- **System Monitoring**: Health checks and performance metrics
+### Core Categories (26 total)
+- **Connection Management** (2): `get-connection-settings`, `update-connection-settings`
+- **Index Operations** (3): `create-index`, `list-indexes`, `delete-index`
+- **Document Management** (2): `get-documents`, `add-documents`
+- **Search Capabilities** (1): `search`
+- **Settings Control** (2): `get-settings`, `update-settings`
+- **Task Monitoring** (3): `get-task`, `get-tasks`, `cancel-tasks`
+- **API Key Management** (3): `get-keys`, `create-key`, `delete-key`
+- **System Monitoring** (6): `health-check`, `get-version`, `get-stats`, `get-health-status`, `get-index-metrics`, `get-system-info`
+- **Chat Completion** (4): `create-chat-completion`, `get-chat-workspaces`, `get-chat-workspace-settings`, `update-chat-workspace-settings`
 
 ### Search Tool Features
 - **Flexible Targeting**: Search specific index or all indices
@@ -278,15 +323,21 @@ The repository includes Claude Code integration via GitHub Actions:
 ## Development Notes
 
 ### Dependencies
-- **MCP Framework**: `mcp>=1.2.1` for protocol implementation
-- **Meilisearch Client**: `meilisearch>=0.34.0` for search engine integration with stable AI-powered search features
-- **HTTP Client**: `httpx>=0.24.0` for async HTTP operations
-- **Data Validation**: `pydantic>=2.0.0` for structured data handling
+- **FastMCP**: `fastmcp>=2.0.0` for MCP server framework with decorator-based tools
+- **HTTP Client**: `httpx>=0.28.1` for async HTTP operations
+- **Data Validation**: `pydantic>=2.11.7` for structured data handling
+- **HTTP Server**: `aiohttp>=3.9.0` for HTTP/SSE endpoints
 
 ### Logging Infrastructure
 - **Structured Logging**: JSON-formatted logs with contextual information
 - **Log Directory**: `~/.meilisearch-mcp/logs/` for persistent logging
 - **Error Tracking**: Comprehensive error logging with tool context
+
+### HTTP/SSE Support
+The server provides HTTP endpoints for Cloud Run deployment:
+- **Health Checks**: `/health`, `/ready` endpoints
+- **MCP Endpoints**: `/mcp`, `/sse`, `/v1/sse` for SSE connections
+- **Message Endpoints**: `/message`, `/v1/message` for POST requests
 
 ### Hybrid Search Implementation
 - **Dependency**: Requires `meilisearch>=0.34.0` for stable AI-powered search features
