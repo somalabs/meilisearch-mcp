@@ -5,7 +5,7 @@ description = "MCP server for Meilisearch"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
-    "httpx>=0.28.1",
+    "httpx[http2]>=0.28.1",
     "pydantic>=2.11.7",
     "aiohttp>=3.9.0",
 ]
