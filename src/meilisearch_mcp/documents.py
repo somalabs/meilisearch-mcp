@@ -26,7 +26,7 @@ class DocumentManager:
         json: Optional[Union[Dict[str, Any], List[Any]]] = None,
     ) -> Dict[str, Any]:
         """Make HTTP request to Meilisearch API using connection pool"""
-        has_auth = "Authorization" in self.headers
+        has_auth = bool(self.api_key)
         logger.debug(
             f"DocumentManager request: {method} {endpoint}",
             url=self.url,
@@ -34,12 +34,12 @@ class DocumentManager:
             has_auth_header=has_auth,
         )
         http_pool = get_http_pool()
-        client = http_pool.get_client(
+        client, headers = http_pool.get_client(
             self.url,
             self.api_key,
             timeout=config.HTTP_TIMEOUT,
         )
-        response = client.request(method=method, url=endpoint, json=json)
+        response = client.request(method=method, url=endpoint, headers=headers, json=json)
         if response.status_code == 401:
             logger.error(
                 "Authentication failed",
@@ -105,12 +105,12 @@ class DocumentManager:
                 endpoint_with_params += f"?{urlencode(params)}"
 
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HTTP_TIMEOUT,
             )
-            response = client.put(endpoint_with_params, json=documents)
+            response = client.put(endpoint_with_params, headers=headers, json=documents)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:

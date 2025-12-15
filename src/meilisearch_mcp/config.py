@@ -19,7 +19,15 @@ class Config:
 
     # MCP server settings
     MCP_AUTH_TOKEN: Optional[str] = os.getenv("MCP_AUTH_TOKEN")
-    PORT: Optional[int] = int(port) if (port := os.getenv("PORT")) else None
+
+    # Parse PORT with error handling
+    _port_str = os.getenv("PORT")
+    PORT: Optional[int] = None
+    if _port_str:
+        try:
+            PORT = int(_port_str)
+        except ValueError:
+            PORT = None
 
     # CORS settings
     CORS_ORIGINS: List[str] = (
@@ -78,43 +86,70 @@ class Config:
                 except Exception:
                     errors.append(f"Invalid CORS origin format: {origin}")
 
-        # Validate numeric settings
+        # Validate numeric settings (both minimum and maximum values)
         if cls.MAX_REQUEST_SIZE < 1024:  # At least 1KB
             errors.append("MAX_REQUEST_SIZE must be at least 1024 bytes")
+        if cls.MAX_REQUEST_SIZE > 1024 * 1024 * 1024:  # Max 1GB
+            errors.append("MAX_REQUEST_SIZE exceeds safe limit of 1GB")
+
         if cls.REQUEST_TIMEOUT < 1.0:
             errors.append("REQUEST_TIMEOUT must be at least 1.0 seconds")
+        if cls.REQUEST_TIMEOUT > 3600.0:  # Max 1 hour
+            errors.append("REQUEST_TIMEOUT exceeds safe limit of 1 hour")
+
         if cls.HTTP_MAX_CONNECTIONS < 1:
             errors.append("HTTP_MAX_CONNECTIONS must be at least 1")
+        if cls.HTTP_MAX_CONNECTIONS > 10000:  # Reasonable upper limit
+            errors.append("HTTP_MAX_CONNECTIONS exceeds safe limit of 10000")
+
+        if cls.HTTP_MAX_KEEPALIVE < 1:
+            errors.append("HTTP_MAX_KEEPALIVE must be at least 1")
+        if cls.HTTP_MAX_KEEPALIVE > cls.HTTP_MAX_CONNECTIONS:
+            errors.append("HTTP_MAX_KEEPALIVE cannot exceed HTTP_MAX_CONNECTIONS")
+
+        if cls.HTTP_TIMEOUT < 0.1:
+            errors.append("HTTP_TIMEOUT must be at least 0.1 seconds")
+        if cls.HTTP_TIMEOUT > 600.0:  # Max 10 minutes
+            errors.append("HTTP_TIMEOUT exceeds safe limit of 10 minutes")
+
         if cls.HEALTH_CHECK_TIMEOUT < 0.1:
             errors.append("HEALTH_CHECK_TIMEOUT must be at least 0.1 seconds")
+        if cls.HEALTH_CHECK_TIMEOUT > 30.0:  # Max 30 seconds
+            errors.append("HEALTH_CHECK_TIMEOUT exceeds safe limit of 30 seconds")
 
         return errors
 
     @classmethod
-    def get_cors_headers(cls) -> dict:
+    def get_cors_headers(cls, request_origin: Optional[str] = None) -> dict:
         """
-        Get CORS headers based on configuration.
+        Get CORS headers based on configuration and request origin.
+
+        Args:
+            request_origin: The Origin header from the incoming request
 
         Returns:
-            Dictionary of CORS headers
+            Dictionary of CORS headers, or empty dict if origin not allowed
         """
         if "*" in cls.CORS_ORIGINS:
+            # Allow all origins
             return {
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Max-Age": "86400",
             }
-        else:
-            # In production, you'd typically check the Origin header
-            # For now, return the first origin or use a default
-            origin = cls.CORS_ORIGINS[0] if cls.CORS_ORIGINS else "*"
+        elif request_origin and request_origin in cls.CORS_ORIGINS:
+            # Allow specific origin that matches
             return {
-                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Origin": request_origin,
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type, Authorization, X-MCP-Token",
+                "Access-Control-Expose-Headers": "Content-Type",
                 "Access-Control-Max-Age": "86400",
             }
+        else:
+            # Origin not allowed, return empty headers
+            return {}
 
 
 # Global config instance

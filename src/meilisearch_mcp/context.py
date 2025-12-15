@@ -6,6 +6,7 @@ including the Meilisearch client and chat manager instances.
 """
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -92,15 +93,23 @@ class ServerContext:
             self._logger.shutdown()
 
 
-# Global context instance - initialized lazily
+# Global context instance - initialized lazily with thread safety
 _context: Optional[ServerContext] = None
+_context_lock = threading.Lock()
 
 
 def get_context() -> ServerContext:
-    """Get the global server context, creating it if necessary."""
+    """
+    Get the global server context, creating it if necessary.
+
+    Uses double-checked locking pattern for thread-safe lazy initialization.
+    """
     global _context
     if _context is None:
-        _context = ServerContext()
+        with _context_lock:
+            # Double-check after acquiring lock
+            if _context is None:
+                _context = ServerContext()
     return _context
 
 
@@ -113,6 +122,12 @@ def set_context(context: ServerContext) -> None:
 def reset_context() -> None:
     """Reset the global context (useful for testing)."""
     global _context
-    if _context:
-        _context.cleanup()
-    _context = None
+    with _context_lock:
+        if _context:
+            try:
+                _context.cleanup()
+            except Exception as e:
+                # Log but don't fail on cleanup errors
+                import logging
+                logging.error(f"Error during context cleanup: {e}")
+        _context = None
