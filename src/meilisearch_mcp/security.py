@@ -62,7 +62,7 @@ def validate_url(url: str) -> bool:
         return False
 
 
-def sanitize_for_logging(value: str, max_length: int = 50) -> str:
+def sanitize_for_logging(value: Optional[str], max_length: int = 50) -> str:
     """
     Sanitize sensitive values for logging.
 
@@ -73,6 +73,8 @@ def sanitize_for_logging(value: str, max_length: int = 50) -> str:
     Returns:
         Sanitized string safe for logging
     """
+    if value is None:
+        return "None"
     if not value:
         return ""
     if len(value) > max_length:
