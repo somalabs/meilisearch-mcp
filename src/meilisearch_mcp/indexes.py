@@ -4,6 +4,8 @@ from urllib.parse import urlencode
 import httpx
 
 from .logging import MCPLogger
+from .http_client import get_http_pool
+from .config import config
 
 logger = MCPLogger()
 
@@ -32,30 +34,31 @@ class IndexManager:
         endpoint: str,
         json: Optional[Union[Dict[str, Any], List[Any]]] = None,
     ) -> Dict[str, Any]:
-        """Make HTTP request to Meilisearch API"""
-        url = f"{self.url}{endpoint}"
+        """Make HTTP request to Meilisearch API using connection pool"""
         # Log request details (without exposing sensitive data)
         has_auth = "Authorization" in self.headers
         logger.debug(
             f"IndexManager request: {method} {endpoint}",
-            url=url,
+            url=self.url,
             method=method,
             has_auth_header=has_auth,
-            headers_count=len(self.headers),
         )
-        with httpx.Client() as client:
-            response = client.request(
-                method=method, url=url, headers=self.headers, json=json, timeout=30.0
+        http_pool = get_http_pool()
+        client = http_pool.get_client(
+            self.url,
+            self.api_key,
+            timeout=config.HTTP_TIMEOUT,
+        )
+        response = client.request(method=method, url=endpoint, json=json)
+        if response.status_code == 401:
+            logger.error(
+                "Authentication failed",
+                endpoint=endpoint,
+                has_auth_header=has_auth,
+                response_text=response.text[:200],
             )
-            if response.status_code == 401:
-                logger.error(
-                    "Authentication failed",
-                    endpoint=endpoint,
-                    has_auth_header=has_auth,
-                    response_text=response.text[:200],
-                )
-            response.raise_for_status()
-            return response.json()
+        response.raise_for_status()
+        return response.json()
 
     def create_index(
         self, uid: str, primary_key: Optional[str] = None
@@ -94,16 +97,19 @@ class IndexManager:
             if limit is not None:
                 params["limit"] = limit
 
-            url = f"{self.url}{endpoint}"
+            endpoint_with_params = endpoint
             if params:
-                url += f"?{urlencode(params)}"
+                endpoint_with_params += f"?{urlencode(params)}"
 
-            with httpx.Client() as client:
-                response = client.request(
-                    method="GET", url=url, headers=self.headers, timeout=30.0
-                )
-                response.raise_for_status()
-                return response.json()
+            http_pool = get_http_pool()
+            client = http_pool.get_client(
+                self.url,
+                self.api_key,
+                timeout=config.HTTP_TIMEOUT,
+            )
+            response = client.get(endpoint_with_params)
+            response.raise_for_status()
+            return response.json()
         except httpx.HTTPStatusError as e:
             raise Exception(f"Failed to list indexes: {e.response.text}")
         except Exception as e:

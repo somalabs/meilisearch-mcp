@@ -8,6 +8,8 @@ from .settings import SettingsManager
 from .keys import KeyManager
 from .logging import MCPLogger
 from .monitoring import MonitoringManager
+from .http_client import get_http_pool
+from .config import config
 
 logger = MCPLogger()
 
@@ -44,38 +46,41 @@ class MeilisearchClient:
     def health_check(self) -> bool:
         """Check if Meilisearch is healthy using GET /health"""
         try:
-            request_url = f"{self.url.rstrip('/')}/health"
-            with httpx.Client() as client:
-                response = client.request(
-                    method="GET", url=request_url, headers=self.headers, timeout=5.0
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data.get("status") == "available"
+            http_pool = get_http_pool()
+            client = http_pool.get_client(
+                self.url,
+                self.api_key,
+                timeout=config.HEALTH_CHECK_TIMEOUT,
+            )
+            response = client.get("/health")
+            response.raise_for_status()
+            data = response.json()
+            return data.get("status") == "available"
         except Exception:
             return False
 
     def get_version(self) -> Dict[str, Any]:
         """Get Meilisearch version information using GET /version"""
         try:
-            request_url = f"{self.url.rstrip('/')}/version"
+            http_pool = get_http_pool()
+            client = http_pool.get_client(
+                self.url,
+                self.api_key,
+                timeout=config.HTTP_TIMEOUT,
+            )
             logger.debug(
                 "Making version request",
-                url=request_url,
+                url=self.url,
                 has_auth_header="Authorization" in self.headers,
-                headers_keys=list(self.headers.keys()),
             )
-            with httpx.Client() as client:
-                response = client.request(
-                    method="GET", url=request_url, headers=self.headers, timeout=30.0
-                )
-                logger.debug(
-                    "Version response received",
-                    status_code=response.status_code,
-                    has_auth_header="Authorization" in self.headers,
-                )
-                response.raise_for_status()
-                return response.json()
+            response = client.get("/version")
+            logger.debug(
+                "Version response received",
+                status_code=response.status_code,
+                has_auth_header="Authorization" in self.headers,
+            )
+            response.raise_for_status()
+            return response.json()
         except httpx.HTTPStatusError as e:
             logger.error(
                 "Failed to get version - HTTP error",
@@ -91,13 +96,15 @@ class MeilisearchClient:
     def get_stats(self) -> Dict[str, Any]:
         """Get database stats using GET /stats"""
         try:
-            request_url = f"{self.url.rstrip('/')}/stats"
-            with httpx.Client() as client:
-                response = client.request(
-                    method="GET", url=request_url, headers=self.headers, timeout=30.0
-                )
-                response.raise_for_status()
-                return response.json()
+            http_pool = get_http_pool()
+            client = http_pool.get_client(
+                self.url,
+                self.api_key,
+                timeout=config.HTTP_TIMEOUT,
+            )
+            response = client.get("/stats")
+            response.raise_for_status()
+            return response.json()
         except httpx.HTTPStatusError as e:
             raise Exception(f"Failed to get stats: {e.response.text}")
         except Exception as e:
@@ -134,21 +141,19 @@ class MeilisearchClient:
             # Add any additional parameters
             search_body.update({k: v for k, v in kwargs.items() if v is not None})
 
+            http_pool = get_http_pool()
+            client = http_pool.get_client(
+                self.url,
+                self.api_key,
+                timeout=config.HTTP_TIMEOUT,
+            )
+
             if index_uid:
                 # Search in specific index using POST /indexes/{index_uid}/search
                 endpoint = f"/indexes/{index_uid}/search"
-                request_url = f"{self.url}{endpoint}"
-
-                with httpx.Client() as client:
-                    response = client.request(
-                        method="POST",
-                        url=request_url,
-                        headers=self.headers,
-                        json=search_body,
-                        timeout=30.0,
-                    )
-                    response.raise_for_status()
-                    return response.json()
+                response = client.post(endpoint, json=search_body)
+                response.raise_for_status()
+                return response.json()
             else:
                 # Search across all indices
                 results = {}
@@ -158,22 +163,13 @@ class MeilisearchClient:
                     try:
                         index_uid = index_data["uid"]
                         endpoint = f"/indexes/{index_uid}/search"
-                        request_url = f"{self.url}{endpoint}"
-
-                        with httpx.Client() as client:
-                            search_response = client.request(
-                                method="POST",
-                                url=request_url,
-                                headers=self.headers,
-                                json=search_body,
-                                timeout=30.0,
-                            )
-                            search_response.raise_for_status()
-                            search_result = search_response.json()
-                            if search_result.get(
-                                "hits"
-                            ):  # Only include indices with matches
-                                results[index_uid] = search_result
+                        search_response = client.post(endpoint, json=search_body)
+                        search_response.raise_for_status()
+                        search_result = search_response.json()
+                        if search_result.get(
+                            "hits"
+                        ):  # Only include indices with matches
+                            results[index_uid] = search_result
                     except httpx.HTTPStatusError as e:
                         logger.warning(
                             f"Failed to search index {index_data.get('uid', 'unknown')}: {e.response.text}"

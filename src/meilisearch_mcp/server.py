@@ -8,6 +8,7 @@ with support for both STDIO and HTTP/SSE transports.
 import asyncio
 import json
 import os
+import sys
 import traceback
 from typing import Optional, Dict, Any
 
@@ -17,6 +18,8 @@ from fastmcp import FastMCP
 from .context import ServerContext, get_context, set_context, reset_context
 from .tools import register_all_tools
 from .logging import MCPLogger
+from .config import config
+from .security import secure_compare, validate_url
 
 # Create FastMCP server instance
 mcp = FastMCP(
@@ -32,7 +35,7 @@ logger = MCPLogger()
 
 
 def create_server(
-    url: str = "http://localhost:7700", api_key: Optional[str] = None
+    url: Optional[str] = None, api_key: Optional[str] = None
 ) -> "MeilisearchMCPServer":
     """Create and return a configured MeilisearchMCPServer instance."""
     return MeilisearchMCPServer(url, api_key)
@@ -49,13 +52,19 @@ class MeilisearchMCPServer:
 
     def __init__(
         self,
-        url: str = "http://localhost:7700",
+        url: Optional[str] = None,
         api_key: Optional[str] = None,
         log_dir: Optional[str] = None,
     ):
         """Initialize MCP server for Meilisearch."""
-        if not log_dir:
-            log_dir = os.path.expanduser("~/.meilisearch-mcp/logs")
+        # Use config defaults if not provided
+        url = url or config.MEILI_HTTP_ADDR
+        api_key = api_key or config.MEILI_MASTER_KEY
+        log_dir = log_dir or config.LOG_DIR
+
+        # Validate URL
+        if not validate_url(url):
+            raise ValueError(f"Invalid URL format: {url}")
 
         # Initialize context with connection settings
         ctx = ServerContext(url=url, api_key=api_key, log_dir=log_dir)
@@ -94,19 +103,19 @@ class MeilisearchMCPServer:
         get_context().update_connection(url, api_key)
 
     def _verify_token(self, request: web.Request) -> bool:
-        """Verify authentication token from request."""
-        expected_token = os.getenv("MCP_AUTH_TOKEN")
+        """Verify authentication token from request using secure comparison."""
+        expected_token = config.MCP_AUTH_TOKEN
         if not expected_token:
             return True
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            return token == expected_token
+            return secure_compare(token, expected_token)
 
         token_header = request.headers.get("X-MCP-Token", "")
         if token_header:
-            return token_header == expected_token
+            return secure_compare(token_header, expected_token)
 
         return False
 
@@ -122,8 +131,9 @@ class MeilisearchMCPServer:
         response.headers["Content-Type"] = "text/event-stream"
         response.headers["Cache-Control"] = "no-cache"
         response.headers["Connection"] = "keep-alive"
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        # Use configurable CORS headers
+        cors_headers = config.get_cors_headers()
+        response.headers.update(cors_headers)
 
         message_queue: asyncio.Queue = asyncio.Queue()
         self._sse_queues.add(message_queue)
@@ -210,28 +220,50 @@ class MeilisearchMCPServer:
         """POST endpoint for MCP protocol - client-to-server communication."""
         if not self._verify_token(request):
             logger.warning("POST request rejected: Unauthorized")
+            cors_headers = config.get_cors_headers()
             return web.json_response(
                 {
                     "jsonrpc": "2.0",
                     "error": {"code": -32000, "message": "Unauthorized"},
                 },
                 status=401,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Headers": "*",
-                },
+                headers=cors_headers,
             )
 
         data = None
         request_id = None
         method = None
         try:
+            # Check request size
+            content_length = request.headers.get("Content-Length")
+            if content_length and int(content_length) > config.MAX_REQUEST_SIZE:
+                logger.warning(
+                    "Request too large",
+                    size=content_length,
+                    max_size=config.MAX_REQUEST_SIZE,
+                    remote=request.remote,
+                )
+                cors_headers = config.get_cors_headers()
+                return web.json_response(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": f"Request too large. Maximum size: {config.MAX_REQUEST_SIZE} bytes",
+                        },
+                    },
+                    status=413,
+                    headers=cors_headers,
+                )
+
             try:
                 data = await request.json()
             except json.JSONDecodeError as e:
                 logger.error(
                     f"Invalid JSON in request body: {e}", remote=request.remote
                 )
+                cors_headers = config.get_cors_headers()
                 return web.json_response(
                     {
                         "jsonrpc": "2.0",
@@ -239,10 +271,7 @@ class MeilisearchMCPServer:
                         "error": {"code": -32700, "message": "Parse error"},
                     },
                     status=400,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+                    headers=cors_headers,
                 )
             except Exception as e:
                 logger.error(
@@ -250,6 +279,7 @@ class MeilisearchMCPServer:
                     remote=request.remote,
                     error_type=type(e).__name__,
                 )
+                cors_headers = config.get_cors_headers()
                 return web.json_response(
                     {
                         "jsonrpc": "2.0",
@@ -257,10 +287,7 @@ class MeilisearchMCPServer:
                         "error": {"code": -32600, "message": "Invalid Request"},
                     },
                     status=400,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+                    headers=cors_headers,
                 )
 
             request_id = data.get("id") if data else None
@@ -337,7 +364,7 @@ class MeilisearchMCPServer:
                         # Execute tool via FastMCP
                         call_result = await asyncio.wait_for(
                             mcp._tool_manager.call_tool(tool_name, tool_args),
-                            timeout=300.0,
+                            timeout=config.REQUEST_TIMEOUT,
                         )
 
                         # Format result for MCP protocol
@@ -438,12 +465,10 @@ class MeilisearchMCPServer:
                         request_id=request_id,
                         via_post=True,
                     )
+                    cors_headers = config.get_cors_headers()
                     return web.json_response(
                         response_data,
-                        headers={
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Headers": "*",
-                        },
+                        headers=cors_headers,
                     )
                 else:
                     logger.info(
@@ -466,14 +491,13 @@ class MeilisearchMCPServer:
                         f"Queued response to {sent_count} SSE stream(s) for method {method}",
                         request_id=request_id,
                     )
+                    cors_headers = config.get_cors_headers()
                     return web.Response(
                         status=202,
-                        headers={
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Headers": "*",
-                        },
+                        headers=cors_headers,
                     )
             else:
+                cors_headers = config.get_cors_headers()
                 return web.json_response(
                     {
                         "jsonrpc": "2.0",
@@ -484,10 +508,7 @@ class MeilisearchMCPServer:
                         },
                     },
                     status=400,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+                    headers=cors_headers,
                 )
 
         except Exception as e:
@@ -503,6 +524,7 @@ class MeilisearchMCPServer:
 
             error_message = str(e) if e else "Internal error"
             try:
+                cors_headers = config.get_cors_headers()
                 return web.json_response(
                     {
                         "jsonrpc": "2.0",
@@ -510,23 +532,18 @@ class MeilisearchMCPServer:
                         "error": {"code": -32603, "message": error_message},
                     },
                     status=500,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+                    headers=cors_headers,
                 )
             except Exception as response_error:
                 logger.error(
                     f"Failed to send error response: {response_error}",
                     traceback=traceback.format_exc(),
                 )
+                cors_headers = config.get_cors_headers()
                 return web.Response(
                     text="Internal Server Error",
                     status=500,
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
+                    headers=cors_headers,
                 )
 
     async def _create_health_check_app(self):
@@ -579,14 +596,10 @@ class MeilisearchMCPServer:
 
         # CORS preflight handler
         async def options_handler(request):
+            cors_headers = config.get_cors_headers()
             return web.Response(
                 status=200,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Max-Age": "86400",
-                },
+                headers=cors_headers,
             )
 
         app.router.add_options("/", options_handler)
@@ -604,7 +617,7 @@ class MeilisearchMCPServer:
 
     async def run(self):
         """Run the MCP server, optionally with HTTP health check for Cloud Run."""
-        port = os.getenv("PORT")
+        port = config.PORT
 
         if port:
             port_num = int(port)
@@ -651,15 +664,27 @@ class MeilisearchMCPServer:
 
     def cleanup(self):
         """Clean shutdown."""
+        from .http_client import get_http_pool
+
+        # Close HTTP clients
+        http_pool = get_http_pool()
+        http_pool.close_all()
+
+        # Reset context
         reset_context()
 
 
 def main():
     """Main entry point."""
-    url = os.getenv("MEILI_HTTP_ADDR", "http://localhost:7700")
-    api_key = os.getenv("MEILI_MASTER_KEY")
+    # Validate configuration
+    errors = config.validate()
+    if errors:
+        logger.error("Configuration validation failed", errors=errors)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
 
-    server = create_server(url, api_key)
+    server = create_server()
     asyncio.run(server.run())
 
 
