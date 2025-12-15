@@ -34,7 +34,11 @@ class KeyManager:
         )
         with httpx.Client() as client:
             response = client.request(
-                method=method, url=request_url, headers=self.headers, json=json, timeout=30.0
+                method=method,
+                url=request_url,
+                headers=self.headers,
+                json=json,
+                timeout=30.0,
             )
             if response.status_code == 401:
                 logger.error(
@@ -49,9 +53,7 @@ class KeyManager:
                 return None
             return response.json()
 
-    def get_keys(
-        self, parameters: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    def get_keys(self, parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Get list of API keys using GET /keys"""
         try:
             endpoint = "/keys"

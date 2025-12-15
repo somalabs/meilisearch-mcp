@@ -170,7 +170,9 @@ class MeilisearchClient:
                             )
                             search_response.raise_for_status()
                             search_result = search_response.json()
-                            if search_result.get("hits"):  # Only include indices with matches
+                            if search_result.get(
+                                "hits"
+                            ):  # Only include indices with matches
                                 results[index_uid] = search_result
                     except httpx.HTTPStatusError as e:
                         logger.warning(
@@ -178,7 +180,9 @@ class MeilisearchClient:
                         )
                         continue
                     except Exception as e:
-                        logger.warning(f"Failed to search index {index_data.get('uid', 'unknown')}: {str(e)}")
+                        logger.warning(
+                            f"Failed to search index {index_data.get('uid', 'unknown')}: {str(e)}"
+                        )
                         continue
 
                 return {"multi_index": True, "query": query, "results": results}

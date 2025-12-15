@@ -72,7 +72,10 @@ class ChatManager:
                                 chunk = json.loads(data_str)
                                 if "choices" in chunk and chunk["choices"]:
                                     choice = chunk["choices"][0]
-                                    if "delta" in choice and "content" in choice["delta"]:
+                                    if (
+                                        "delta" in choice
+                                        and "content" in choice["delta"]
+                                    ):
                                         content_parts.append(choice["delta"]["content"])
                             except json.JSONDecodeError:
                                 continue
@@ -84,7 +87,9 @@ class ChatManager:
             return full_response
 
         except httpx.HTTPStatusError as e:
-            error_msg = f"Meilisearch API error in create_chat_completion: {e.response.text}"
+            error_msg = (
+                f"Meilisearch API error in create_chat_completion: {e.response.text}"
+            )
             logger.error(error_msg)
             raise Exception(error_msg)
         except Exception as e:
@@ -130,7 +135,9 @@ class ChatManager:
                 )
                 return workspaces
         except httpx.HTTPStatusError as e:
-            error_msg = f"Meilisearch API error in get_chat_workspaces: {e.response.text}"
+            error_msg = (
+                f"Meilisearch API error in get_chat_workspaces: {e.response.text}"
+            )
             logger.error(error_msg)
             raise Exception(error_msg)
         except Exception as e:
