@@ -44,12 +44,12 @@ class IndexManager:
             has_auth_header=has_auth,
         )
         http_pool = get_http_pool()
-        client = http_pool.get_client(
+        client, headers = http_pool.get_client(
             self.url,
             self.api_key,
             timeout=config.HTTP_TIMEOUT,
         )
-        response = client.request(method=method, url=endpoint, json=json)
+        response = client.request(method=method, url=endpoint, json=json, headers=headers)
         if response.status_code == 401:
             logger.error(
                 "Authentication failed",
@@ -102,12 +102,12 @@ class IndexManager:
                 endpoint_with_params += f"?{urlencode(params)}"
 
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HTTP_TIMEOUT,
             )
-            response = client.get(endpoint_with_params)
+            response = client.get(endpoint_with_params, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:

@@ -110,6 +110,7 @@ def get_context() -> ServerContext:
             # Double-check after acquiring lock
             if _context is None:
                 _context = ServerContext()
+            return _context
     return _context
 
 

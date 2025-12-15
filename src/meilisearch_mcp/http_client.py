@@ -98,14 +98,22 @@ class HTTPClientPool:
         return self._clients[client_key], headers
 
     def close_all(self) -> None:
-        """Close all HTTP clients and clean up resources."""
+        """
+        Close all HTTP clients and clean up resources.
+
+        Note: Uses synchronous close() since we're using httpx.Client (not AsyncClient).
+        If async cleanup is needed, convert to AsyncClient and use aclose().
+        """
         with self._lock:
-            for client in self._clients.values():
+            for client_key, client in list(self._clients.items()):
                 try:
                     client.close()
+                except httpx.HTTPError as e:
+                    # Log specific HTTP errors
+                    logging.error(f"HTTP error closing client {client_key}: {e}")
                 except Exception as e:
-                    # Log but don't fail on cleanup errors
-                    logging.error(f"Error closing HTTP client: {e}")
+                    # Log other errors but don't fail on cleanup
+                    logging.error(f"Error closing HTTP client {client_key}: {e}")
             self._clients.clear()
             self._client_locks.clear()
 

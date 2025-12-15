@@ -47,12 +47,12 @@ class MeilisearchClient:
         """Check if Meilisearch is healthy using GET /health"""
         try:
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HEALTH_CHECK_TIMEOUT,
             )
-            response = client.get("/health")
+            response = client.get("/health", headers=headers)
             response.raise_for_status()
             data = response.json()
             return data.get("status") == "available"
@@ -63,7 +63,7 @@ class MeilisearchClient:
         """Get Meilisearch version information using GET /version"""
         try:
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HTTP_TIMEOUT,
@@ -71,13 +71,13 @@ class MeilisearchClient:
             logger.debug(
                 "Making version request",
                 url=self.url,
-                has_auth_header="Authorization" in self.headers,
+                has_auth_header="Authorization" in headers,
             )
-            response = client.get("/version")
+            response = client.get("/version", headers=headers)
             logger.debug(
                 "Version response received",
                 status_code=response.status_code,
-                has_auth_header="Authorization" in self.headers,
+                has_auth_header="Authorization" in headers,
             )
             response.raise_for_status()
             return response.json()
@@ -86,7 +86,6 @@ class MeilisearchClient:
                 "Failed to get version - HTTP error",
                 status_code=e.response.status_code,
                 response_text=e.response.text[:200],
-                has_auth_header="Authorization" in self.headers,
             )
             raise Exception(f"Failed to get version: {e.response.text}")
         except Exception as e:
@@ -97,12 +96,12 @@ class MeilisearchClient:
         """Get database stats using GET /stats"""
         try:
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HTTP_TIMEOUT,
             )
-            response = client.get("/stats")
+            response = client.get("/stats", headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -142,7 +141,7 @@ class MeilisearchClient:
             search_body.update({k: v for k, v in kwargs.items() if v is not None})
 
             http_pool = get_http_pool()
-            client = http_pool.get_client(
+            client, headers = http_pool.get_client(
                 self.url,
                 self.api_key,
                 timeout=config.HTTP_TIMEOUT,
@@ -151,7 +150,7 @@ class MeilisearchClient:
             if index_uid:
                 # Search in specific index using POST /indexes/{index_uid}/search
                 endpoint = f"/indexes/{index_uid}/search"
-                response = client.post(endpoint, json=search_body)
+                response = client.post(endpoint, json=search_body, headers=headers)
                 response.raise_for_status()
                 return response.json()
             else:
@@ -163,7 +162,7 @@ class MeilisearchClient:
                     try:
                         index_uid = index_data["uid"]
                         endpoint = f"/indexes/{index_uid}/search"
-                        search_response = client.post(endpoint, json=search_body)
+                        search_response = client.post(endpoint, json=search_body, headers=headers)
                         search_response.raise_for_status()
                         search_result = search_response.json()
                         if search_result.get(

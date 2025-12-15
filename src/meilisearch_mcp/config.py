@@ -8,6 +8,7 @@ and validation for production deployments.
 import os
 from typing import Optional, List
 from urllib.parse import urlparse
+from .security import validate_url
 
 
 class Config:
@@ -138,8 +139,8 @@ class Config:
                 "Access-Control-Allow-Headers": "*",
                 "Access-Control-Max-Age": "86400",
             }
-        elif request_origin and request_origin in cls.CORS_ORIGINS:
-            # Allow specific origin that matches
+        elif request_origin and validate_url(request_origin) and request_origin in cls.CORS_ORIGINS:
+            # Validate origin URL format and check if it matches allowed origins
             return {
                 "Access-Control-Allow-Origin": request_origin,
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -148,7 +149,7 @@ class Config:
                 "Access-Control-Max-Age": "86400",
             }
         else:
-            # Origin not allowed, return empty headers
+            # Origin not allowed or invalid, return empty headers
             return {}
 
 
